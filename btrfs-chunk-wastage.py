@@ -5,46 +5,52 @@ parser = argparse.ArgumentParser(description='Print a Histogram of how much spac
 parser.add_argument('path', metavar='path', type=str, default="/", nargs='?', help='Pth to the filesystem (defaults to /)')
 path = parser.parse_args().path
 
-# ensure root
-import os
-if os.getuid() != 0:
-    from elevate import elevate
-    elevate(graphical=False)
+# # ensure root
+# import os
+# if os.getuid() != 0:
+#     from elevate import elevate
+#     elevate(graphical=False)
 
+from bisect import bisect_right
 import btrfs
+import shutil
 
 fs = btrfs.FileSystem(path)
 
-bg = lambda chunk: fs.block_group(chunk.vaddr, chunk.length)
-
-ratios = [ block_group.used / block_group.length for block_group in map(bg,fs.chunks()) if block_group.flags & btrfs.BLOCK_GROUP_TYPE_MASK == btrfs.BLOCK_GROUP_DATA ]
-
-import numpy as np
-import shutil
+try:
+    blocks = ( fs.block_group(block.vaddr, block.length) for block in fs.chunks() )
+    blocks = [ block for block in blocks if block.flags & btrfs.BLOCK_GROUP_TYPE_MASK == btrfs.BLOCK_GROUP_DATA ]
+except PermissionError:
+    print("Permission denied, can't load chunks data. Please run as root.")
+    exit(1)
 
 resolution = 20
-maxwidth = shutil.get_terminal_size((80, 20)).columns
+extra_edges = (0.00001, 0.99999)
+left_edges = sorted((*extra_edges, *( i/resolution for i in range(0,resolution+1)) ))
 
-counts, bin_edges = np.histogram(ratios, bins=[0,0.00001]+list(np.linspace(0,1,resolution+1))[1:-1]+[0.99999,1])
-sizes = counts.astype(float)
+bins_saveable = [0]*len(left_edges)
+bins_count    = [0]*len(left_edges)
+for block in blocks:
+    bin = bisect_right(left_edges, block.used/block.length) - 1
+    bins_saveable[bin] += block.length-block.used
+    bins_count[bin]    += 1
 
-sizes *= 1024**3 * ( 1 - bin_edges[:-1] )
+max_saveable = max(bins_saveable)
+maxwidth = shutil.get_terminal_size((80, 0)).columns  # get term width, default to width 80
 
-bars = sizes.copy()
-bars /= bars.max()
-bars *= maxwidth - 40
-bars *= 2
-bars = bars.round().astype(int)
-
-bins = zip( bin_edges[:-1], bin_edges[1:] )
-
-print(" Usage  | estimated savable space (number of chunks)")
+print(" Usage  | savable space (number of chunks)")
 started = 0
-for bin, size, bar, count in zip( bins, sizes, bars, counts ):
-    if not size and not started:
+for le, saveable, count in zip(left_edges,bins_saveable,bins_count):
+    if not saveable and not started:
         continue
     started = 1
     
-    print(f"{bin[0]*100:6.3f}% | {'█'*(bar//2)}{'▌'*(bar%2)}\t {btrfs.utils.pretty_size(size)} ({count})")
+    bar = saveable/max_saveable * (maxwidth - 40) * 2  # 40 chars space for other stuff left and right. *2 cause we use half-width rendering
+    bar = round(bar)
+    
+    if le < 1:
+        print(f"{le*100:6.3f}% | {'█'*(bar//2)}{'▌'*(bar%2)}\t {btrfs.utils.pretty_size(saveable)} ({count})")
+    else:
+        print(f"100.00% | {'█'*(bar//2)}{'▌'*(bar%2)}\t {btrfs.utils.pretty_size(saveable)} ({count})")
 
-print(f"Total savable {btrfs.utils.pretty_size((len(ratios)-sum(ratios))*1024**3)}")
+print(f"Total savable {btrfs.utils.pretty_size(sum(bins_saveable))}")
